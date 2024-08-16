@@ -1,0 +1,117 @@
+
+///////////////  this gives the stable values/////////
+
+#include <SPI.h>
+#include "protocentralAds1292r.h"
+#include "ecgRespirationAlgo.h"
+
+// ADS1292R pin definitions
+const int ADS1292_DRDY_PIN = 6;
+const int ADS1292_CS_PIN = 53;
+const int ADS1292_START_PIN = 5;
+const int ADS1292_PWDN_PIN = 4;
+
+// Initialize objects for ADS1292R and ECG/Respiration algorithms
+ads1292r ADS1292R;
+ecg_respiration_algorithm ECG_RESPIRATION_ALGORITHM;
+
+// Variables for data storage and processing
+volatile uint8_t globalHeartRate = 0;
+volatile uint8_t globalRespirationRate = 0;
+int16_t ecgWaveBuff, ecgFilterout;
+int16_t resWaveBuff, respFilterout;
+
+// Variables for moving average calculation
+const int MOVING_AVERAGE_WINDOW_SIZE_HR = 5; // Moving average window size for Heart Rate
+const int MOVING_AVERAGE_WINDOW_SIZE_RR = 30; // Moving average window size for Respiration Rate
+int heartRateBuffer[MOVING_AVERAGE_WINDOW_SIZE_HR];
+int respirationRateBuffer[MOVING_AVERAGE_WINDOW_SIZE_RR];
+int heartRateSum = 0;
+int respirationRateSum = 0;
+int heartRateBufferIndex = 0;
+int respirationRateBufferIndex = 0;
+
+void setup() {
+  // Initialize Serial communication
+  Serial.begin(57600);
+
+  // Initialize SPI communication
+  SPI.begin();
+  SPI.setBitOrder(MSBFIRST);
+  SPI.setDataMode(SPI_MODE1);
+  SPI.setClockDivider(SPI_CLOCK_DIV16); // Set SPI clock to 1 MHz
+
+  // Initialize ADS1292R pins
+  pinMode(ADS1292_DRDY_PIN, INPUT);
+  pinMode(ADS1292_CS_PIN, OUTPUT);
+  pinMode(ADS1292_START_PIN, OUTPUT);
+  pinMode(ADS1292_PWDN_PIN, OUTPUT);
+
+  // Initialize ADS1292R module
+  ADS1292R.ads1292Init(ADS1292_CS_PIN, ADS1292_PWDN_PIN, ADS1292_START_PIN);
+
+  // Initialize heart rate and respiration rate buffers
+  for (int i = 0; i < MOVING_AVERAGE_WINDOW_SIZE_HR; i++) {
+    heartRateBuffer[i] = 0;
+  }
+  for (int i = 0; i < MOVING_AVERAGE_WINDOW_SIZE_RR; i++) {
+    respirationRateBuffer[i] = 0;
+  }
+
+  // Wait for ADS1292R initialization
+  delay(2000);
+  Serial.println("Initialization completed.");
+}
+
+void loop() {
+  ads1292OutputValues ecgRespirationValues;
+
+  // Check for data ready signal from ADS1292R
+  if (digitalRead(ADS1292_DRDY_PIN) == LOW) {
+    // Read ECG and Respiration samples from ADS1292R
+    boolean ret = ADS1292R.getAds1292EcgAndRespirationSamples(ADS1292_DRDY_PIN, ADS1292_CS_PIN, &ecgRespirationValues);
+    if (ret == true) {
+      // Extract ECG and Respiration wave data
+      ecgWaveBuff = (int16_t)(ecgRespirationValues.sDaqVals[1] >> 8);  // Ignore lower 8 bits
+      resWaveBuff = (int16_t)(ecgRespirationValues.sresultTempResp >> 8);
+
+      // Check lead-off detection and process samples if lead-off is not detected
+      if (!ecgRespirationValues.leadoffDetected) {
+        // Process ECG signal
+        ECG_RESPIRATION_ALGORITHM.ECG_ProcessCurrSample(&ecgWaveBuff, &ecgFilterout);
+        ECG_RESPIRATION_ALGORITHM.QRS_Algorithm_Interface(ecgFilterout, &globalHeartRate);
+
+        // Process Respiration signal
+        respFilterout = ECG_RESPIRATION_ALGORITHM.Resp_ProcessCurrSample(resWaveBuff);
+        ECG_RESPIRATION_ALGORITHM.RESP_Algorithm_Interface(respFilterout, &globalRespirationRate);
+
+        // Update heart rate moving average buffer
+        heartRateSum -= heartRateBuffer[heartRateBufferIndex];
+        heartRateBuffer[heartRateBufferIndex] = globalHeartRate;
+        heartRateSum += globalHeartRate;
+
+        // Update respiration rate moving average buffer
+        respirationRateSum -= respirationRateBuffer[respirationRateBufferIndex];
+        respirationRateBuffer[respirationRateBufferIndex] = globalRespirationRate;
+        respirationRateSum += globalRespirationRate;
+
+        // Increment buffer indices
+        heartRateBufferIndex = (heartRateBufferIndex + 1) % MOVING_AVERAGE_WINDOW_SIZE_HR;
+        respirationRateBufferIndex = (respirationRateBufferIndex + 1) % MOVING_AVERAGE_WINDOW_SIZE_RR;
+
+        // Calculate moving averages
+        int averageHeartRate = heartRateSum / MOVING_AVERAGE_WINDOW_SIZE_HR;
+        int averageRespirationRate = respirationRateSum / MOVING_AVERAGE_WINDOW_SIZE_RR;
+
+        // Print ECG and Respiration filtered outputs and rates
+        Serial.print("Heart Rate: ");
+        Serial.println(averageHeartRate);
+        Serial.print("Respiration Rate: ");
+        Serial.println(averageRespirationRate);
+      } else {
+        ecgFilterout = 0;
+        respFilterout = 0;
+      }
+    }
+  }
+}
